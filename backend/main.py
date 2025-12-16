@@ -2,12 +2,21 @@ import os
 import pickle
 from typing import List, Optional
 
-import google.generativeai as genai
+try:
+    import google.generativeai as genai
+    HAS_GEMINI = True
+except ImportError:
+    HAS_GEMINI = False
+    print("Warning: google-generativeai not found. Chat features will be disabled.")
+except AttributeError:
+    # Handle the specific 'packages_distributions' error on Python < 3.10
+    HAS_GEMINI = False
+    print("Warning: google-generativeai failed to load (Python version incompatibility). Chat features disabled.")
 import numpy as np
 import pandas as pd
 import uvicorn
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, File, UploadFile
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -39,12 +48,9 @@ CHAT_MODEL = None
 load_dotenv()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-# --- Serve built frontend if present (for single-container deploys) ---
-FRONTEND_DIST = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "frontend-react", "dist"))
-if os.path.exists(FRONTEND_DIST):
-    app.mount("/", StaticFiles(directory=FRONTEND_DIST, html=True), name="frontend")
-else:
-    print("Frontend dist not found; API-only mode.")
+
+# Static files mount moved to the end
+
 
 def load_models():
     model_dir = "../models"
@@ -112,6 +118,10 @@ def init_chat_model():
     Initialize the Gemini model if an API key is available.
     """
     global CHAT_MODEL
+    if not HAS_GEMINI:
+        print("Skipping Gemini init: Library not loaded.")
+        return
+        
     if not GEMINI_API_KEY:
         print("GEMINI_API_KEY not set; chat endpoint will return 503.")
         return
@@ -147,11 +157,18 @@ def init_chat_model():
 
         # Auto-detect supported models (generateContent)
         preferred = [
-            # Current GA models
+            # Stable GA models (Higher limits)
+            "models/gemini-1.5-flash",
+            "models/gemini-1.5-flash-001",
+            "models/gemini-1.5-flash-002",
+            "models/gemini-1.5-pro",
+            "models/gemini-1.5-pro-001",
+            "models/gemini-1.5-pro-002",
+            "models/gemini-pro", 
+            "models/gemini-1.0-pro",
+            # Newer previews (might have stricter limits)
             "models/gemini-2.5-flash",
-            "models/gemini-2.5-pro",
             "models/gemini-2.0-flash",
-            "models/gemini-2.0-flash-001",
             # Backward-compatible fallbacks
             "models/gemini-flash-latest",
             "models/gemini-pro-latest",
@@ -190,7 +207,87 @@ class TransactionInput(BaseModel):
 class CategorizeInput(BaseModel):
     merchant: str
 
+class ChatInput(BaseModel):
+    query: str
+
 # --- Endpoints ---
+
+
+# --- Helpers ---
+def clean_currency(val):
+    if isinstance(val, str):
+        cleaned = pd.Series(val).str.replace(r'[^\d.-]', '', regex=True).values[0]
+        return cleaned
+    return val
+
+def is_mostly_numeric(series):
+    clean = series.astype(str).str.replace(r'[^\d.-]', '', regex=True)
+    numeric = pd.to_numeric(clean, errors='coerce')
+    return numeric.notna().mean() > 0.5
+
+@app.post("/upload")
+async def upload_csv(file: UploadFile = File(...)):
+    try:
+        data_path = "../data/processed/cleaned_transactions.csv"
+        
+        # Save temp
+        temp_path = f"../data/processed/{file.filename}"
+        with open(temp_path, "wb") as f:
+            f.write(await file.read())
+
+        new_df = pd.read_csv(temp_path)
+        
+        # Cleanup temp file
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+
+        # Robust Logic
+        required_cols = {"Date", "Merchant", "Amount"}
+        
+        # 1. Check strict columns
+        if not required_cols.issubset(new_df.columns):
+            # 2. Smart Swap Heuristic
+            if "Amount" in new_df.columns and "Category" in new_df.columns:
+                if not is_mostly_numeric(new_df["Amount"]) and is_mostly_numeric(new_df["Category"]):
+                    new_df.rename(columns={'Amount': 'Temp', 'Category': 'Amount'}, inplace=True)
+                    new_df.rename(columns={'Temp': 'Category'}, inplace=True)
+
+        # 3. Currency Cleaning
+        if "Amount" in new_df.columns:
+            new_df["Amount"] = new_df["Amount"].apply(clean_currency)
+            new_df["Amount"] = pd.to_numeric(new_df["Amount"], errors="coerce")
+
+        # 4. Fill defaults
+        if "Merchant" not in new_df.columns: new_df["Merchant"] = "Unknown"
+        if "Category" not in new_df.columns: new_df["Category"] = "Uncategorized"
+        
+        new_df["Merchant"] = new_df["Merchant"].fillna("Unknown")
+        new_df["Category"] = new_df["Category"].fillna("Uncategorized")
+        new_df["Amount"] = new_df["Amount"].fillna(0)
+        
+        # 5. Date Parsing
+        if "Date" in new_df.columns:
+            new_df["Date"] = pd.to_datetime(new_df["Date"], dayfirst=True, errors="coerce")
+            new_df.dropna(subset=["Date"], inplace=True)
+            new_df["Month"] = new_df["Date"].dt.strftime("%Y-%m")
+            new_df["Date"] = new_df["Date"].dt.strftime("%Y-%m-%d")
+            
+        new_df["Is_Expense"] = True
+        new_df["Is_Anomaly"] = False # Default
+
+        # Append
+        if os.path.exists(data_path):
+            existing = pd.read_csv(data_path)
+            combined = pd.concat([existing, new_df], ignore_index=True)
+            combined.to_csv(data_path, index=False)
+        else:
+            new_df.to_csv(data_path, index=False)
+            
+        return {"message": "CSV uploaded and merged successfully", "count": len(new_df)}
+
+    except Exception as e:
+        print(f"Upload failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/")
 def read_root():
@@ -340,73 +437,70 @@ def add_transaction(transaction: TransactionInput):
             "Description": transaction.merchant if transaction.merchant else "Unknown",
             "Amount": transaction.amount,
             "Category": transaction.category,
-            "Is_Expense": True, # Assume expense for now
-            "Month": pd.to_datetime(transaction.date).strftime("%Y-%m")
+            "Is_Expense": True,
+            "Month": pd.to_datetime(transaction.date).strftime("%Y-%m"),
+            "Is_Anomaly": False # Default
         }
         
         # Append to CSV
         if os.path.exists(data_path):
             df = pd.read_csv(data_path)
-            # Use pd.concat properly
-            df = pd.concat([df, pd.DataFrame([new_record])], ignore_index=True)
+            new_df = pd.DataFrame([new_record])
+            df = pd.concat([df, new_df], ignore_index=True)
             df.to_csv(data_path, index=False)
+            return {"message": "Transaction added successfully"}
         else:
+             # Create new if doesn't exist
             df = pd.DataFrame([new_record])
             df.to_csv(data_path, index=False)
+            return {"message": "Transaction file created and transaction added"}
             
-        return {"message": "Transaction added successfully", "transaction": new_record}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-class ChatMessage(BaseModel):
-    role: str
-    content: str
-
-class ChatInput(BaseModel):
-    query: str
-    history: Optional[List[ChatMessage]] = None
-
 @app.post("/chat")
-def chat_bot(input_data: ChatInput):
+@app.post("/chat")
+def chat_endpoint(input_data: ChatInput):
     """
-    Simple chatbot endpoint. 
-    Uses GEMINI_API_KEY from environment to call Google Gemini API.
+    Chat with the AI financial advisor.
     """
-    if not GEMINI_API_KEY:
-        raise HTTPException(status_code=503, detail="GEMINI_API_KEY not configured")
-    if CHAT_MODEL is None:
-        # Try to initialize once more (e.g., if startup failed)
-        init_chat_model()
-        if CHAT_MODEL is None:
-            raise HTTPException(status_code=500, detail="Failed to initialize Gemini model")
+    if not CHAT_MODEL:
+        raise HTTPException(status_code=503, detail="Chat model not initialized")
 
     try:
-        snapshot = build_spend_snapshot()
-        prompt_parts = [
-            "You are FinMate's AI Advisor. Provide concise, practical financial guidance "
-            "based on the user's question. Keep answers under 120 words, avoid hallucinating "
-            "account-specific data, and if the request is ambiguous ask ONE short clarifying question.",
-        ]
-        if snapshot:
-            prompt_parts.append(snapshot)
-        prompt_parts.append("Chat so far (latest last):")
-        if input_data.history:
-            for m in input_data.history[-10:]:
-                role = m.role if m.role in ("user", "assistant") else "user"
-                prompt_parts.append(f"{role}: {m.content}")
-        # Append the new user turn
-        prompt_parts.append(f"user: {input_data.query}")
+        # Build Context
+        context = build_spend_snapshot() or "No recent transaction data available."
+        
+        system_prompt = (
+            "You are FinMate, a helpful and friendly financial assistant. "
+            "You have access to the user's recent spending summary below. "
+            "Use this context to answer questions if relevant. "
+            "If the user asks about something else, just answer normally. "
+            "Keep answers concise and practical.\n\n"
+            f"CONTEXT:\n{context}\n\n"
+            f"USER QUERY: {input_data.query}"
+        )
+        
+        response = CHAT_MODEL.generate_content(system_prompt)
+        
+        # Safety check
+        if response.candidates and response.candidates[0].content.parts:
+             return {"response": response.text}
+        else:
+             return {"response": "I'm sorry, I couldn't generate a response for that query due to safety settings."}
 
-        prompt = "\n".join(prompt_parts)
-        result = CHAT_MODEL.generate_content(prompt)
-        return {"response": result.text}
     except Exception as e:
-        # Log full stack for easier debugging
-        import traceback
-        print("Gemini chat error:", repr(e))
-        traceback.print_exc()
-        # Surface a clearer error to the client
-        raise HTTPException(status_code=500, detail=f"Gemini chat failed: {e}")
+        print(f"Chat generation failed: {e}")
+        # Return a friendly error instead of 500
+        return {"response": "I'm having trouble thinking right now. Please try again."}
+
+# --- Serve built frontend if present (for single-container deploys) ---
+# MOUNTED LAST to avoid intercepting API routes
+FRONTEND_DIST = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "frontend-react", "dist"))
+if os.path.exists(FRONTEND_DIST):
+    app.mount("/", StaticFiles(directory=FRONTEND_DIST, html=True), name="frontend")
+else:
+    print("Frontend dist not found; API-only mode.")
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
